@@ -12,6 +12,7 @@
 #include <thread>
 #include <mutex>
 #include <chrono>
+#include <atomic>
 using namespace std;
 #pragma endregion
 
@@ -57,12 +58,15 @@ struct item {
 #pragma endregion
 
 #pragma region MapleData
+thread* t = nullptr;
+mutex mlock;
+atomic_bool connected;
 map<string, player> players;
 #pragma endregion
 
 #pragma region Loading and Saving
 void load() {
-	ifstream file("data");
+	ifstream file("players.dat", ios::in);
 	if (!file) {
 		return;
 	}
@@ -76,10 +80,12 @@ void load() {
 		file >> p.exp;
 		players[p.name] = p;
 	}
+	file.close();
 }
 void save() {
-	ofstream file("data");
+	ofstream file("players.dat", ios::out);
 	int n = count_if(players.begin(), players.end(), [&](pair<const string, player>& it){return !it.second.name.empty();});
+	file << n << endl;
 	for (auto it = players.begin(); it != players.end(); it++) {
 		player& p = it->second;
 		if (p.name.empty()) {
@@ -89,6 +95,16 @@ void save() {
 		file << p.pass << endl;
 		file << p.level << endl;
 		file << p.exp << endl;
+	}
+	file.close();
+}
+#pragma endregion
+
+#pragma region The loop
+void loop() {
+	while (connected) {
+		this_thread::sleep_for(chrono::seconds(5));
+		lock_guard<mutex> l(mlock);
 	}
 }
 #pragma endregion
@@ -101,8 +117,11 @@ struct irc_ctx_t {
 void event_connect(irc_session_t* s, const char* e, const char* origin, const char** params, unsigned int count) {
 	irc_ctx_t* ctx = (irc_ctx_t*)irc_get_ctx(s);
 	irc_cmd_join(s, ctx->channel, 0);
+	connected = true;
+	t = new thread(loop);
 }
 void event_msg(irc_session_t* s, const char* e, const char* origin, const char** params, unsigned int count) {
+	lock_guard<mutex> l(mlock);
 	string fullnick = origin;
 	size_t p = fullnick.find('!');
 	string nick = fullnick.substr(0, p);
@@ -116,6 +135,7 @@ void event_msg(irc_session_t* s, const char* e, const char* origin, const char**
 	vector<string> c;
 	copy(istream_iterator<string>(iss), istream_iterator<string>(), back_inserter<vector<string>>(c));
 #define cassert(n) if (c.size() < n) {irc_cmd_msg(s, nick.c_str(), "Invalid number of arguments"); return;}
+#define reply(x) irc_cmd_msg(s, nick.c_str(), x)
 	cassert(1);
 	if (nick == "Retep998") {
 		if (c[0] == "identify") {
@@ -131,16 +151,16 @@ void event_msg(irc_session_t* s, const char* e, const char* origin, const char**
 			irc_cmd_quit(s, "Shutting down...");
 		} else if (c[0] == "save") {
 			save();
-			irc_cmd_msg(s, "Retep998", "Data saved");
+			reply("Data saved");
 		} else if (c[0] == "load") {
 			load();
-			irc_cmd_msg(s, "Retep998", "Data loaded");
+			reply("Data loaded");
 		}
 	}
 	if (c[0] == "register") {
 		cassert(3);
 		if (!players[c[1]].name.empty()) {
-			irc_cmd_msg(s, nick.c_str(), "That name has already been taken");
+			reply("That name has already been taken");
 			return;
 		}
 		player p;
@@ -150,24 +170,39 @@ void event_msg(irc_session_t* s, const char* e, const char* origin, const char**
 		p.exp = 0;
 		players[p.name] = p;
 		irc_cmd_msg(s, "#maplerpg", ("Please welcome our new player "+p.name).c_str());
+	} else if (c[0] == "login") {
+		cassert(3);
+		player& p = players[c[1]];
+		if (p.name.empty()) {
+			reply("That character doesn't exist");
+			return;
+		}
+		if (c[2] != p.pass) {
+			reply("Incorrect password");
+			return;
+		}
+		p.user = nick;
+		irc_cmd_msg(s, "#maplerpg", (p.name+" is now signed in from "+p.user).c_str());
 	} else if (c[0] == "help" or c[0] == "?") {
 		if (c.size() == 1) {
-			irc_cmd_msg(s, nick.c_str(), "Available commands");
-			irc_cmd_msg(s, nick.c_str(), "register <username> <password>");
+			reply("Available commands");
+			reply( "register <username> <password>");
+			reply("login <username> <password>");
 			if (nick == "Retep998") {
-				irc_cmd_msg(s, nick.c_str(), "slap <name>");
-				irc_cmd_msg(s, nick.c_str(), "kick <name>");
-				irc_cmd_msg(s, nick.c_str(), "save");
-				irc_cmd_msg(s, nick.c_str(), "load");
-				irc_cmd_msg(s, nick.c_str(), "exit");
-				irc_cmd_msg(s, nick.c_str(), "identify <password>");
+				reply("slap <name>");
+				reply("kick <name>");
+				reply("save");
+				reply("load");
+				reply("exit");
+				reply("identify <password>");
 			}
 		} else {
-			irc_cmd_msg(s, nick.c_str(), "I don't know anything more about that command");
+			reply("I don't know anything more about that command");
 		}
 	}
 }
 void event_cmsg(irc_session_t* s, const char* e, const char* origin, const char** params, unsigned int count) {
+	lock_guard<mutex> l(mlock);
 	string fullnick = origin;
 	size_t p = fullnick.find('!');
 	string nick = fullnick.substr(0, p);
@@ -177,12 +212,14 @@ void event_cmsg(irc_session_t* s, const char* e, const char* origin, const char*
 		msg = params[1];
 	}
 	cout << "[" << chan << "]" << nick << ": " << msg << endl;
-	if (nick != "Retep998" or chan != "#maplerpg") {
-		auto it = find_if(players.begin(), players.end(), [&](pair<const string, player>& it){return it.second.user == nick;});
-		if (it != players.end()) {
-			irc_cmd_msg(s, chan.c_str(), (nick+" has died and lost 5% of their exp").c_str());
-			it->second.exp = max(0, it->second.exp-0.05*exptnl[it->second.level]);
-		}
+	if (chan != "#maplerpg") {
+		return;
+	}
+	auto it = find_if(players.begin(), players.end(), [&](pair<const string, player>& it){return it.second.user == nick;});
+	if (it != players.end()) {
+		player& p = it->second;
+		irc_cmd_msg(s, chan.c_str(), (p.name+" has died and lost 5% of their exp").c_str());
+		p.exp = max(0, p.exp-0.05*exptnl[p.level]);
 	}
 }
 #pragma endregion
@@ -206,6 +243,8 @@ int main() {
 	irc_connect(s, "irc.fyrechat.net", 6667, 0, "MapleBot", "MapleBot", "MapleBot");
 	load();
 	irc_run(s);
+	connected = false;
+	t->join();
 	save();
 	return 0;
 }
