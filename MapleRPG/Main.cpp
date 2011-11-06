@@ -1,5 +1,6 @@
 #pragma region Includes
 #include "libircclient.h"
+#include "sha1.h"
 #include <iostream>
 #include <string>
 #include <cstdint>
@@ -38,6 +39,16 @@ const int exptnl[199] = {
 	451506220, 476248760, 502347192, 529875818, 558913012, 589541445, 621848316, 655925603, 691870326, 729784819,
 	769777027, 811960808, 856456260, 903390063, 952895838, 1005114529, 1060194805, 1118293480, 1179575962, 1244216724,
 	1312399800, 1384319309, 1460180007, 1540197871, 1624600714, 1713628833, 1807535693, 1906558648, 2011069705
+};
+#pragma endregion
+
+#pragma region Utility Functions
+string passhash(string s) {
+	static unsigned char hash[20];
+	static char hexstring[41];
+	sha1::calc(("91225dcd39598ebb2ac72941e55ec1c94c62bb74"+s).c_str(), s.size() ,hash); // 10 is the length of the string
+	sha1::toHexString(hash, hexstring);
+	return hexstring;
 };
 #pragma endregion
 
@@ -105,6 +116,12 @@ void loop() {
 	while (connected) {
 		this_thread::sleep_for(chrono::seconds(5));
 		lock_guard<mutex> l(mlock);
+		for (auto it = players.begin(); it != players.end(); it++) {
+			player& p = it->second;
+			if (p.name.empty()) {
+				continue;
+			}
+		}
 	}
 }
 #pragma endregion
@@ -165,7 +182,7 @@ void event_msg(irc_session_t* s, const char* e, const char* origin, const char**
 		}
 		player p;
 		p.name = c[1];
-		p.pass = c[2];
+		p.pass = passhash(c[1]+c[2]);
 		p.level = 0;
 		p.exp = 0;
 		players[p.name] = p;
@@ -177,17 +194,25 @@ void event_msg(irc_session_t* s, const char* e, const char* origin, const char**
 			reply("That character doesn't exist");
 			return;
 		}
-		if (c[2] != p.pass) {
+		if (passhash(c[1]+c[2]) != p.pass) {
 			reply("Incorrect password");
 			return;
 		}
 		p.user = nick;
 		irc_cmd_msg(s, "#maplerpg", (p.name+" is now signed in from "+p.user).c_str());
+	} else if (c[0] == "logout") {
+		auto it = find_if(players.begin(), players.end(), [&](pair<const string, player>& it){return it.second.user == nick;});
+		if (it != players.end()) {
+			player& p = it->second;
+			p.user = "";
+			irc_cmd_msg(s, "#maplerpg", (p.name+" signed out").c_str());
+		}
 	} else if (c[0] == "help" or c[0] == "?") {
 		if (c.size() == 1) {
 			reply("Available commands");
 			reply( "register <username> <password>");
 			reply("login <username> <password>");
+			reply("logout");
 			if (nick == "Retep998") {
 				reply("slap <name>");
 				reply("kick <name>");
@@ -218,8 +243,34 @@ void event_cmsg(irc_session_t* s, const char* e, const char* origin, const char*
 	auto it = find_if(players.begin(), players.end(), [&](pair<const string, player>& it){return it.second.user == nick;});
 	if (it != players.end()) {
 		player& p = it->second;
-		irc_cmd_msg(s, chan.c_str(), (p.name+" has died and lost 5% of their exp").c_str());
+		reply("You died and lost 5% of your exp");
 		p.exp = max(0, p.exp-0.05*exptnl[p.level]);
+	}
+}
+void event_nick(irc_session_t* s, const char* e, const char* origin, const char** params, unsigned int count) {
+	lock_guard<mutex> l(mlock);
+	string fullnick = origin;
+	size_t p = fullnick.find('!');
+	string nick = fullnick.substr(0, p);
+	string newnick = params[0];
+	cout << nick << " changed their nickname to " << newnick << endl;
+	auto it = find_if(players.begin(), players.end(), [&](pair<const string, player>& it){return it.second.user == nick;});
+	if (it != players.end()) {
+		player& p = it->second;
+		p.user = newnick;
+	}
+}
+void event_leave(irc_session_t* s, const char* e, const char* origin, const char** params, unsigned int count) {
+	lock_guard<mutex> l(mlock);
+	string fullnick = origin;
+	size_t p = fullnick.find('!');
+	string nick = fullnick.substr(0, p);
+	cout << nick << " has left" << endl;
+	auto it = find_if(players.begin(), players.end(), [&](pair<const string, player>& it){return it.second.user == nick;});
+	if (it != players.end()) {
+		player& p = it->second;
+		p.user = "";
+		irc_cmd_msg(s, "#maplerpg", (p.name+" signed out").c_str());
 	}
 }
 #pragma endregion
@@ -237,6 +288,9 @@ int main() {
 	callbacks.event_notice = event_msg;
 	callbacks.event_privmsg = event_msg;
 	callbacks.event_channel = event_cmsg;
+	callbacks.event_nick = event_nick;
+	callbacks.event_quit = event_leave;
+	callbacks.event_part = event_leave;
 	irc_session_t* s = irc_create_session(&callbacks);
 	irc_ctx_t ctx = {"#maplerpg", "MapleBot"};
 	irc_set_ctx(s, &ctx);
